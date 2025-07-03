@@ -1,0 +1,287 @@
+name: "Update GitOps Image Tag"
+description: "Update the image tag in the GitOps repository"
+inputs:
+  owner:
+    description: "Owner of the repository if it is not the current one"
+    default: ${{ github.repository_owner }}
+    required: false
+
+  repo:
+    description: "Repository on which to update the image tag"
+    required: true
+
+  image-tag:
+    description: "The tag of the image to be updated"
+    required: true
+
+  app-id:
+    description: "The id of the GitHub App"
+    required: true
+
+  private-key:
+    description: "The private key of the GitHub App"
+    required: true
+
+  component-name:
+    description: "The directory the component manifests are in"
+    required: true
+
+  overlays-path:
+    description: "The path where the overlays are stored, it will be suffixed with the component-name"
+    default: ""
+
+  image-tag-file-name:
+    description: "The name of the file to be updated"
+    default: image.yaml
+
+  values-path:
+    description: "where the image-tag-path should be applied"
+    default: .spec.values
+
+  image-tag-path:
+    description: "The path to the image tag in the file to be updated"
+    default: .global.image.tag
+
+  deploy-private-key:
+    description: "The private deploy key for the GitOps repo (optional alternative to GitHub App auth)"
+    required: false
+
+author: DIT KRG
+
+runs:
+  using: "composite"
+
+  steps:
+    - name: Install yq
+      uses: jaxxstorm/action-install-gh-release@v2.1.0
+      with:
+        repo: mikefarah/yq
+        tag: v4.45.2
+        cache: enable
+
+    # Conditionally generate a token if not using deploy key
+    - name: Generate token
+      if: inputs.deploy-private-key == ''
+      id: generate-token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: ${{ inputs.owner }}
+        repositories: ${{ inputs.repo }}
+
+    # Set up SSH if using deploy key
+    - name: Setup SSH access for deploy key
+      if: inputs.deploy-private-key != ''
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ inputs.deploy-private-key }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+    # Use SSH-based checkout if deploy key is present
+    - name: Checkout target repository using SSH
+      if: inputs.deploy-private-key != ''
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.owner }}/${{ inputs.repo }} # Replace with the actual target repository
+        ssh-key: ${{ inputs.deploy-private-key }} # use ssh key
+
+    # Default checkout with token if not using deploy key
+    - name: Checkout target repository
+      if: inputs.deploy-private-key == ''
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.owner }}/${{ inputs.repo }} # Replace with the actual target repository
+        token: ${{ steps.generate-token.outputs.token }} # insert the token
+
+    - name: Get environment
+      id: get-environment
+      shell: bash
+      run: |
+
+        if [[ $GITHUB_REF == refs/tags/* ]]; then
+          environment=production
+        elif [[ $GITHUB_REF == refs/heads/main ]]; then
+          environment=staging
+        else
+          environment=dev
+        fi
+        echo "environment=$environment" >> $GITHUB_OUTPUT
+
+    - name: Find target file
+      id: find-target-file
+      shell: bash
+      env:
+        TARGET_ENV: ${{ steps.get-environment.outputs.environment }}
+      run: |
+
+        if [ $TARGET_ENV == "production" ]; then
+          target_file="${{ inputs.overlays-path }}production/${{ inputs.image-tag-file-name }}"
+        elif [ $TARGET_ENV == "staging" ]; then
+          target_file="${{ inputs.overlays-path }}staging/${{ inputs.image-tag-file-name }}"
+        else
+          target_file="${{ inputs.overlays-path }}development/${{ inputs.image-tag-file-name }}"
+        fi
+
+        echo "target_file=$target_file" >> $GITHUB_OUTPUT
+
+    - name: Create label
+      id: create-label
+      shell: bash
+      env:
+        REPO: ${{ inputs.owner }}/${{ inputs.repo }}
+        LABEL_NAME: auto-deploy
+        LABEL_COLOR: 00FF00
+        LABEL_DESCRIPTION: "This label is used to automatically close a pr when the deployment is done"
+        GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+
+      run: gh label create "$LABEL_NAME" --force --color "$LABEL_COLOR" --description "$LABEL_DESCRIPTION"
+
+    - name: Get branch name
+      id: get-branch-name
+      shell: bash
+      env:
+        TARGET_ENV: ${{ steps.get-environment.outputs.environment }}
+      run: |
+        COMPONENT_NAME=${{ inputs.component-name }}
+        # replace all / with - in the component name
+
+        COMPONENT_NAME=${COMPONENT_NAME//\//-}
+
+        if [ $TARGET_ENV == "production" ]; then
+          BRANCH_NAME="prod-release"
+        elif [ $TARGET_ENV == "staging" ]; then
+          BRANCH_NAME="staging-release"
+        else
+          BRANCH_NAME=update-${{ steps.get-environment.outputs.environment }}-$COMPONENT_NAME
+        fi
+
+        echo "TARGET_BRANCH=$BRANCH_NAME" >> $GITHUB_OUTPUT
+
+    - name: Create branch if not exists
+      shell: bash
+      env:
+        TARGET_FILE: ${{ inputs.component-name }}/${{ steps.find-target-file.outputs.target_file }}
+        TARGET_BRANCH: ${{ steps.get-branch-name.outputs.TARGET_BRANCH }}
+      run: |
+
+        # Do not create a new branch if the branch already exists
+        if [[ $(git ls-remote origin "$TARGET_BRANCH") ]]; then
+          git fetch
+          git checkout "$TARGET_BRANCH"
+        else
+          git checkout -b "$TARGET_BRANCH"
+          git push --set-upstream origin "$TARGET_BRANCH"
+        fi
+
+        # check if we have conflicts with main
+        git fetch
+        git rebase $TARGET_BRANCH
+        if [ $? -ne 0 ]; then
+          git checkout --theirs $TARGET_FILE
+          git add $TARGET_FILE
+          git rebase --continue
+          git push --force
+        fi
+      # Use the REST API to commit changes, so we get automatic commit signing
+    - name: Commit changes
+      id: commit
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+        FULL_IMAGE_TAG: ${{ inputs.image-tag }}
+        TARGET_FILE: ${{ inputs.component-name }}/${{ steps.find-target-file.outputs.target_file }}
+        TARGET_BRANCH: ${{ steps.get-branch-name.outputs.TARGET_BRANCH }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_SERVER_URL: ${{ github.server_url }}
+      run: |
+
+
+        # Update the image.yaml file with the new image tag
+        MESSAGE=$(cat <<-END
+        ###########################################################################################
+        the lines below are automatically generated by the auto-deploy action. Do not edit manually.#
+        ###########################################################################################
+        GITHUB_REPOSITORY: $GITHUB_REPOSITORY
+        END)
+
+        export MESSAGE
+        export IMAGE_TAG="${FULL_IMAGE_TAG##*:}"  # Removes everything up to and including the last colon
+        export GITHUB_REPO_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+
+        # Initialize the YAML output
+        yq -i '${{ inputs.values-path }}.global comments=""' "$TARGET_FILE"
+        yq -i '(${{ inputs.values-path }}.global | key) head_comment |= strenv(MESSAGE)' $TARGET_FILE
+
+        yq -i '
+          ${{ inputs.values-path }}${{ inputs.image-tag-path }} = strenv(IMAGE_TAG) |
+          ${{ inputs.values-path }}.annotations.GITHUB_REPO_URL = strenv(GITHUB_REPO_URL) |
+          ${{ inputs.values-path }}.annotations.GITHUB_COMMIT_HASH = strenv(GITHUB_SHA)
+          ' "$TARGET_FILE"
+
+        # If the file has not changes then don't commit
+        if [[ -z $(git status --porcelain $TARGET_FILE) ]]; then
+          echo "commit=false" >> $GITHUB_OUTPUT
+          echo "No changes to commit"
+          exit 0
+        fi
+        echo "Committing changes"
+        echo "commit=true" >> $GITHUB_OUTPUT
+
+        export MESSAGE="chore: Update ${{ inputs.component-name }} image tag to $image_tag_only in ${{ steps.get-environment.outputs.environment }}"
+        export SHA=$( git rev-parse $TARGET_BRANCH:$TARGET_FILE )
+        export CONTENT=$( base64 -i $TARGET_FILE )
+        gh api --silent --method PUT /repos/${{ inputs.owner }}/${{ inputs.repo }}/contents/$TARGET_FILE \
+          --field message="$MESSAGE" \
+          --field content="$CONTENT" \
+          --field encoding="base64" \
+          --field branch="$TARGET_BRANCH" \
+          --field sha="$SHA"
+
+    - name: Create PR and try to merge
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+        LABEL_NAME: auto-deploy
+        TARGET_ENV: ${{ steps.get-environment.outputs.environment }}
+        TARGET_FILE: ${{ steps.find-target-file.outputs.target_file }}
+        HEAD_BRANCH: ${{ steps.get-branch-name.outputs.TARGET_BRANCH }}
+        IS_COMMIT: ${{ steps.commit.outputs.commit }}
+      run: |
+        # reset the local changes and pull changes from the remote branch (Because we are using the REST API to commit changes and not the git cli)
+        git reset --hard
+        git pull
+        # If the file has not changes then don't commit
+        if [ $IS_COMMIT == "true" ]; then
+          # Do not create a PR if the PR already exists, just export the PR url else create a new PR if the TARGET_ENV it production or staging then do not add the auto-deploy label else add the auto-deploy label and export the PR url
+          if [[ $(gh pr list --state open --base main --head $HEAD_BRANCH) ]]; then
+            echo "PR already exists"
+            pr_url=$(gh pr list --state open --base main --head $HEAD_BRANCH --json url --jq '.[0].url')
+          else
+            if [ $TARGET_ENV == "production" ]; then
+              pr_url=$(gh pr create --title "Production release" --body "Populating PR description with release notes :clock130: ..." --base main --head $HEAD_BRANCH)
+
+            elif [ $TARGET_ENV == "staging" ]; then
+              pr_url=$(gh pr create --title "Staging release" --body "Populating PR description with release notes :clock130: ..." --base main --head $HEAD_BRANCH)
+
+            else
+              pr_url=$(gh pr create --title "chore: Update ${{ inputs.component-name }} image tag in ${{ steps.get-environment.outputs.environment }}" --body "This PR was automatically created by the auto-deploy action" --base main --head $HEAD_BRANCH --label $LABEL_NAME)
+            fi
+          fi
+
+          # Add PR URL to job summary
+          echo "### Pull Request Created" >> $GITHUB_STEP_SUMMARY
+          echo "PR URL: $pr_url" >> $GITHUB_STEP_SUMMARY
+
+          GREEN='\e[32m'
+          RESET='\e[0m'
+          echo -e "${GREEN} Pull Request: $pr_url${RESET}"
+        fi
+
+        # try to merge the PR if the TARGET_ENV is dev
+        if [ $TARGET_ENV == "dev" ]; then
+          echo "Merging PR"
+          gh pr merge --auto --merge --delete-branch
+        fi
